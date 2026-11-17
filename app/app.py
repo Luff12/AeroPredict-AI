@@ -5,7 +5,7 @@ import plotly.express as px
 import tensorflow as tf
 import joblib
 import os
-
+import sys
 from pathlib import Path
 
 # ==================================================
@@ -303,6 +303,7 @@ page = st.sidebar.radio(
         "Model Comparison",
         "Explainable AI",
         "Model Information",
+        "Manual RUL Prediction",
     ],
 )
 
@@ -341,7 +342,264 @@ st.write("")
 
 
 # ==================================================
-# 8. DATASET UPLOAD
+# 8. MANUAL RUL PREDICTION PAGE
+# ==================================================
+
+# This page uses the separately saved LSTM and tuned XGBoost models
+# from notebooks/models. It is placed before dataset upload so it can
+# run without uploading test_FD001.txt.
+
+MANUAL_MODEL_DIR = BASE_DIR / "notebooks" / "models"
+
+TRAIN_DATA_PATH = BASE_DIR / "dataset" / "raw" / "train_FD001.txt"
+
+
+@st.cache_data
+def load_training_data():
+    dataset_columns = ["Engine_ID", "Cycle", "Setting_1", "Setting_2", "Setting_3"] + [
+        f"Sensor_{i}" for i in range(1, 22)
+    ]
+
+    df = pd.read_csv(TRAIN_DATA_PATH, sep=r"\s+", header=None)
+    df.columns = dataset_columns
+
+    return df.sort_values(["Engine_ID", "Cycle"])
+
+
+@st.cache_resource
+def load_manual_assets(model_dir):
+    manual_lstm = tf.keras.models.load_model(model_dir / "lstm_model.keras")
+    manual_xgb = joblib.load(model_dir / "xgboost_model.pkl")
+    manual_lstm_scaler = joblib.load(model_dir / "lstm_scaler.pkl")
+    manual_features = joblib.load(model_dir / "feature_columns.pkl")
+    return manual_lstm, manual_xgb, manual_lstm_scaler, manual_features
+
+
+if page == "Manual RUL Prediction":
+
+    st.markdown("## Manual RUL Prediction")
+    st.markdown(
+        "Enter engine operating measurements to estimate Remaining Useful Life. "
+        "This page uses the models saved from the FD001 training workflow."
+    )
+
+    st.info(
+        "Use realistic sensor readings in the same units and feature order as "
+        "the NASA C-MAPSS FD001 training data. These predictions are for "
+        "project demonstration and are not certified maintenance advice."
+    )
+
+    try:
+        manual_lstm, manual_xgb, manual_lstm_scaler, manual_features = (
+            load_manual_assets(MANUAL_MODEL_DIR)
+        )
+    except Exception as e:
+        st.error(
+            "Could not load the manual prediction models. Check that these files "
+            f"exist in: {MANUAL_MODEL_DIR}\n\nDetails: {e}"
+        )
+        st.stop()
+
+    model_choice = st.selectbox(
+        "Choose prediction model",
+        ["LSTM", "Tuned XGBoost"],
+        help=(
+            "LSTM requires 30 consecutive cycles. Tuned XGBoost uses one "
+            "feature row representing the latest cycle."
+        ),
+    )
+
+    st.divider()
+
+    if model_choice == "LSTM":
+
+        st.markdown("### Enter 30 consecutive operating cycles")
+        st.caption(
+            "Fill all 30 rows. Each row represents one consecutive cycle, "
+            "and the columns must contain the 18 selected model features. "
+            "The final row should be the latest cycle."
+        )
+
+        # Load real sample measurements from the FD001 training dataset.
+        try:
+            training_data = load_training_data()
+
+            sample_engine_id = st.selectbox(
+                "Choose a sample engine",
+                sorted(training_data["Engine_ID"].unique()),
+                key="lstm_sample_engine",
+            )
+
+            if st.button("Load Sample Data for LSTM"):
+                sample_rows = (
+                    training_data.loc[
+                        training_data["Engine_ID"] == sample_engine_id,
+                        manual_features,
+                    ]
+                    .tail(30)
+                    .reset_index(drop=True)
+                )
+
+                if len(sample_rows) != 30:
+                    st.warning("The selected engine does not have 30 cycles.")
+                else:
+                    # Clear the editor's previous widget state so the sample
+                    # values are displayed in the editor after rerunning.
+                    st.session_state["lstm_sample_values"] = sample_rows
+                    if "manual_lstm_input" in st.session_state:
+                        del st.session_state["manual_lstm_input"]
+                    st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not load the FD001 training dataset: {e}")
+
+        blank_input = pd.DataFrame(
+            np.nan,
+            index=range(30),
+            columns=manual_features,
+        )
+
+        editor_data = st.session_state.get("lstm_sample_values", blank_input)
+
+        manual_input = st.data_editor(
+            editor_data,
+            use_container_width=True,
+            num_rows="fixed",
+            hide_index=True,
+            key="manual_lstm_input",
+            column_config={
+                feature: st.column_config.NumberColumn(
+                    feature,
+                    help=f"Enter the {feature} measurement for this cycle.",
+                    format="%.6f",
+                )
+                for feature in manual_features
+            },
+        )
+
+        if st.button("Predict RUL with LSTM", type="primary"):
+
+            if manual_input.isnull().values.any():
+                st.error("Please fill in every cell in all 30 rows before predicting.")
+            else:
+                try:
+                    values = manual_input[manual_features].astype(float).values
+                    scaled_values = manual_lstm_scaler.transform(values)
+                    sequence = scaled_values.reshape(1, 30, len(manual_features))
+                    prediction = float(manual_lstm.predict(sequence, verbose=0)[0][0])
+                    prediction = max(0.0, prediction)
+
+                    st.divider()
+                    result_col1, result_col2 = st.columns(2)
+                    result_col1.metric(
+                        "Predicted Remaining Useful Life", f"{prediction:.2f} cycles"
+                    )
+
+                    if prediction > 60:
+                        status = "Healthy"
+                        result_col2.success(status)
+                    elif prediction > 30:
+                        status = "Warning"
+                        result_col2.warning(status)
+                    else:
+                        status = "Critical"
+                        result_col2.error(status)
+
+                    st.caption(
+                        "Health categories use illustrative project thresholds: "
+                        "above 60 = Healthy, above 30 = Warning, and 30 or below = Critical."
+                    )
+                except Exception as e:
+                    st.error(f"LSTM prediction failed: {e}")
+
+    else:
+
+        st.markdown("### Enter latest-cycle feature values")
+        st.caption(
+            "Enter one latest-cycle measurement for each feature. "
+            "Tuned XGBoost was trained on unscaled feature values, so no scaler is applied here."
+        )
+
+        # Load the latest real measurement from a selected FD001 engine.
+        try:
+            training_data = load_training_data()
+
+            sample_engine_id = st.selectbox(
+                "Choose a sample engine",
+                sorted(training_data["Engine_ID"].unique()),
+                key="xgb_sample_engine",
+            )
+
+            if st.button("Load Sample Data for XGBoost"):
+                sample_row = (
+                    training_data.loc[training_data["Engine_ID"] == sample_engine_id]
+                    .sort_values("Cycle")
+                    .tail(1)
+                )
+
+                if sample_row.empty:
+                    st.warning("No sample measurements were found for this engine.")
+                else:
+                    for feature in manual_features:
+                        st.session_state[f"manual_xgb_{feature}"] = float(
+                            sample_row.iloc[0][feature]
+                        )
+                    st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not load the FD001 training dataset: {e}")
+
+        values = {}
+        input_columns = st.columns(3)
+
+        for index, feature in enumerate(manual_features):
+            with input_columns[index % 3]:
+                values[feature] = st.number_input(
+                    feature,
+                    value=0.0,
+                    format="%.6f",
+                    key=f"manual_xgb_{feature}",
+                )
+
+        if st.button("Predict RUL with Tuned XGBoost", type="primary"):
+            try:
+                input_df = pd.DataFrame(
+                    [[values[feature] for feature in manual_features]],
+                    columns=manual_features,
+                )
+                prediction = float(manual_xgb.predict(input_df)[0])
+                prediction = max(0.0, prediction)
+
+                st.divider()
+                result_col1, result_col2 = st.columns(2)
+                result_col1.metric(
+                    "Predicted Remaining Useful Life", f"{prediction:.2f} cycles"
+                )
+
+                if prediction > 60:
+                    status = "Healthy"
+                    result_col2.success(status)
+                elif prediction > 30:
+                    status = "Warning"
+                    result_col2.warning(status)
+                else:
+                    status = "Critical"
+                    result_col2.error(status)
+
+                st.caption(
+                    "Health categories use illustrative project thresholds: "
+                    "above 60 = Healthy, above 30 = Warning, and 30 or below = Critical."
+                )
+            except Exception as e:
+                st.error(f"Tuned XGBoost prediction failed: {e}")
+
+    st.divider()
+    st.caption("AeroPredict AI | NASA C-MAPSS FD001 | Manual prediction mode")
+    st.stop()
+
+
+# ==================================================
+# 9. DATASET UPLOAD
 # ==================================================
 
 st.markdown("### Upload Engine Dataset")
